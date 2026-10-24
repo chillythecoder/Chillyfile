@@ -73,16 +73,38 @@ def index():
 @app.post("/upload")
 def upload():
     file = request.files.get("file")
+
     if not file or not file.filename:
         return jsonify(error="No file selected"), 400
+
     original = secure_filename(file.filename) or "file"
     token = secrets.token_urlsafe(9)
     stored_name = f"{token}__{original}"
+    destination = UPLOAD_DIR / stored_name
+
     try:
-        file.save(UPLOAD_DIR / stored_name)
+        # Save the uploaded file in chunks to avoid loading
+        # the entire file into memory at once.
+        with open(destination, "wb") as output:
+            while True:
+                chunk = file.stream.read(1024 * 1024)  # 1 MB
+                if not chunk:
+                    break
+                output.write(chunk)
+
     except Exception:
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        app.logger.exception("Upload failed")
         return jsonify(error="Could not save this file"), 500
-    return jsonify(url=request.host_url.rstrip("/") + "/f/" + token, name=original)
+
+    return jsonify(
+        url=request.host_url.rstrip("/") + "/f/" + token,
+        name=original
+             )
 
 @app.get("/f/<token>")
 def download(token):
