@@ -86,6 +86,82 @@ def upload():
 
 @app.get("/f/<token>")
 def download(token):
+    matches = list(UPLOAD_DIR.glob(token + "__*"))
+
+    if not matches:
+        abort(404)
+
+    path = matches[0]
+    filename = path.name.split("__", 1)[1]
+
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Download - ChillyFile</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {
+                background: #081426;
+                color: white;
+                font-family: Arial, sans-serif;
+                text-align: center;
+                padding: 100px 20px;
+            }
+            .box {
+                background: #0e2038;
+                padding: 40px;
+                border-radius: 16px;
+                max-width: 450px;
+                margin: auto;
+            }
+            h1 { color: #20a8ff; }
+            .button {
+                display: inline-block;
+                background: #168cff;
+                color: white;
+                padding: 15px 35px;
+                border-radius: 8px;
+                text-decoration: none;
+                font-weight: bold;
+                margin-top: 20px;
+            }
+            .filename {
+                overflow-wrap: anywhere;
+                color: #b8cbe5;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="box">
+            <h1>ChillyFile</h1>
+            <h2>Your file is ready!</h2>
+            <p class="filename">{{ filename }}</p>
+            <a class="button" href="{{ url_for('get_file', token=token) }}">
+                Download File
+            </a>
+        </div>
+    </body>
+    </html>
+    """, filename=filename, token=token)
+
+
+@app.get("/download/<token>")
+def get_file(token):
+    matches = list(UPLOAD_DIR.glob(token + "__*"))
+
+    if not matches:
+        abort(404)
+
+    path = matches[0]
+
+    return send_from_directory(
+        UPLOAD_DIR,
+        path.name,
+        as_attachment=True,
+        download_name=path.name.split("__", 1)[1]
+    )
+ 
     # Token is the random prefix; filenames are never accepted directly from the URL.
     matches = list(UPLOAD_DIR.glob(token + "__*"))
     if not matches:
@@ -101,3 +177,4 @@ if __name__ == "__main__":
     print("ChillyFile is starting at http://127.0.0.1:5000")
     print("For local testing only. Read README before exposing it to the internet.")
     app.run(host="127.0.0.1", port=int(os.environ.get("PORT","5000")), debug=False)
+ 
