@@ -1,202 +1,525 @@
-from flask import Flask, request, send_from_directory, jsonify, render_template_string, abort
-from werkzeug.utils import secure_filename
-from pathlib import Path
-import secrets
 import os
+import re
+import sqlite3
+import secrets
+from pathlib import Path
+from functools import wraps
+
+import boto3
+from flask import (
+    Flask, request, redirect, url_for, session,
+    render_template_string, abort, flash, send_from_directory
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from botocore.config import Config
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
 
 APP_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = APP_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
-MAX_FILE_MB = int(os.environ.get("CHILLYFILE_MAX_MB", "512"))
 
-app = Flask(__name__)
+DATABASE = APP_DIR / "chillyfile.db"
+MAX_FILE_MB = int(os.environ.get("CHILLYFILE_MAX_MB", "512"))
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_MB * 1024 * 1024
 
-PAGE = r"""<!doctype html>
+# Backblaze B2 uses its S3-compatible API.
+# These variables must be configured in Render before cloud uploads are enabled.
+B2_KEY_ID = os.environ.get("B2_KEY_ID")
+B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY")
+B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME")
+B2_ENDPOINT_URL = os.environ.get("B2_ENDPOINT_URL")
+
+b2 = None
+if all([B2_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_NAME, B2_ENDPOINT_URL]):
+    b2 = boto3.client(
+        "s3",
+        endpoint_url=B2_ENDPOINT_URL,
+        aws_access_key_id=B2_KEY_ID,
+        aws_secret_access_key=B2_APPLICATION_KEY,
+        config=Config(signature_version="s3v4"),
+    )
+
+
+def db():
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_database():
+    with db() as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT UNIQUE NOT NULL,
+                filename TEXT NOT NULL,
+                storage_key TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                uploader_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (uploader_id) REFERENCES users(id)
+            )
+        """)
+
+
+initialize_database()
+
+
+def login_required(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if "user_id" not in session:
+            flash("Please log in first.")
+            return redirect(url_for("login"))
+        return function(*args, **kwargs)
+    return wrapper
+
+
+PAGE = """
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ChillyFile.io — Simple file sharing</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChillyFile.io</title>
 <style>
-:root{color-scheme:dark;--bg:#081426;--panel:#0e2038;--blue:#20a8ff;--text:#f4f8ff;--muted:#b8cbe5}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 50% 20%,#122b49 0%,var(--bg) 65%);font-family:Inter,Segoe UI,Arial,sans-serif;color:var(--text);min-height:100vh}
-header{height:82px;border-bottom:1px solid #203650;display:flex;align-items:center;justify-content:space-between;padding:0 clamp(18px,4vw,56px)}
-.brand{font-weight:800;font-size:clamp(22px,3vw,34px);letter-spacing:-1px;color:var(--text)}.brand span{color:var(--blue)}
-nav{color:var(--muted);font-size:15px}main{max-width:900px;margin:58px auto 50px;padding:0 20px;text-align:center}h1{font-size:clamp(36px,5vw,56px);margin:0 0 10px;letter-spacing:-1.5px} .sub{font-size:21px;color:#b8d5f7;margin-bottom:32px}
-.drop{border:2px dashed #169fff;border-radius:16px;background:#0c1e34b8;padding:48px 18px;cursor:pointer;transition:.18s;min-height:260px;display:flex;flex-direction:column;align-items:center;justify-content:center}
-.drop.drag{background:#123454;border-color:#8bd5ff;transform:scale(1.01)}.cloud{font-size:54px;color:var(--blue);line-height:1.2}.drop strong{font-size:22px;margin:14px 0 8px}.drop p{margin:0;color:var(--muted)}.tiny{font-size:14px;margin-top:20px!important}
-.status{display:none;text-align:left;margin-top:18px;background:#092f38;border:1px solid #12616a;border-radius:12px;padding:16px;color:#d9fff6;overflow-wrap:anywhere}.status a{color:#7ed0ff}.bar{height:7px;background:#18334d;border-radius:10px;overflow:hidden;margin-top:12px}.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#168cff,#51e0d0);transition:width .15s}
-.features{display:grid;grid-template-columns:repeat(4,1fr);gap:22px;margin:60px auto 0;text-align:center}.feature .ico{font-size:32px;color:var(--blue)}.feature b{display:block;margin:10px 0;font-size:17px}.feature p{color:var(--muted);font-size:14px;line-height:1.5;margin:0}
-footer{color:#7890ad;text-align:center;font-size:12px;padding:20px}
-@media(max-width:650px){header{height:70px}nav{display:none}main{margin-top:38px}.drop{padding:35px 14px;min-height:230px}.features{grid-template-columns:repeat(2,1fr);margin-top:42px}}
-</style></head>
-<body>
-<header><div class="brand">Chilly<span>File.io</span></div><nav>Simple uploads · Shareable links · No ads</nav></header>
-<main><h1>Upload Files</h1><div class="sub">Fast. Simple. No weird ads.</div>
-<div class="drop" id="drop" role="button" tabindex="0" aria-label="Choose files to upload">
-<div class="cloud">☁↑</div><strong>Drag &amp; drop files here</strong><p>or click to browse</p><p class="tiny">Files start uploading automatically after selection</p>
-<input id="files" type="file" multiple hidden>
-</div>
-<div class="status" id="status" aria-live="polite"><div id="message">Preparing upload…</div><div class="bar"><i id="progress"></i></div><div id="links"></div></div>
-</main>
-<script>
-const drop=document.getElementById('drop'), picker=document.getElementById('files'), statusBox=document.getElementById('status');
-drop.addEventListener('click',()=>picker.click()); drop.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();picker.click()}});
-picker.addEventListener('change',()=>uploadFiles([...picker.files]));
-for(const ev of ['dragenter','dragover']) drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('drag')});
-for(const ev of ['dragleave','drop']) drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('drag')});
-drop.addEventListener('drop',e=>uploadFiles([...e.dataTransfer.files]));
-async function uploadFiles(files){
- if(!files.length)return; statusBox.style.display='block';document.getElementById('links').innerHTML='';
- for(const file of files){
-  document.getElementById('message').textContent=`Uploading ${file.name}…`;document.getElementById('progress').style.width='0%';
-  try{
-   const form=new FormData();form.append('file',file);
-   const result=await new Promise((resolve,reject)=>{
-    const xhr=new XMLHttpRequest();xhr.open('POST','/upload');xhr.upload.onprogress=e=>{if(e.lengthComputable)document.getElementById('progress').style.width=Math.round(e.loaded/e.total*100)+'%'};
-    xhr.onload=()=>{let data;try{data=JSON.parse(xhr.responseText)}catch{reject(new Error('Unexpected server response'));return} if(xhr.status>=200&&xhr.status<300)resolve(data);else reject(new Error(data.error||'Upload failed'))};
-    xhr.onerror=()=>reject(new Error('Network error'));xhr.send(form);
-   });
-   document.getElementById('message').textContent=`Uploaded: ${file.name}`;
-   const row=document.createElement('p');row.innerHTML='Share link: ';const a=document.createElement('a');a.href=result.url;a.textContent=result.url;a.target='_blank';a.rel='noopener';row.appendChild(a);
-   const copy=document.createElement('button');copy.textContent=' Copy link';copy.style.cssText='margin-left:8px;cursor:pointer';copy.onclick=async()=>{try{await navigator.clipboard.writeText(result.url);copy.textContent=' Copied!'}catch{prompt('Copy this link:',result.url)}};row.appendChild(copy);document.getElementById('links').appendChild(row);
-  }catch(err){document.getElementById('message').textContent=`Could not upload ${file.name}: ${err.message}`;}
- }
- picker.value='';
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    background: #07111f;
+    color: #eaf2ff;
+    font-family: Arial, sans-serif;
 }
-</script></body></html>"""
+header {
+    padding: 20px;
+    background: #0b1d35;
+    border-bottom: 1px solid #203a5b;
+}
+nav {
+    max-width: 900px;
+    margin: auto;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 15px;
+    flex-wrap: wrap;
+}
+.logo { color: #60c7ff; font-size: 25px; font-weight: bold; }
+a { color: #60c7ff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+nav a { margin-left: 12px; }
+main { max-width: 800px; margin: 35px auto; padding: 0 16px; }
+.card {
+    background: #10243d;
+    border: 1px solid #234362;
+    border-radius: 14px;
+    padding: 22px;
+    margin-bottom: 20px;
+}
+h1, h2 { margin-top: 0; }
+input, textarea, button {
+    width: 100%;
+    margin-top: 10px;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid #355779;
+    font: inherit;
+}
+input, textarea { background: #08182a; color: white; }
+textarea { resize: vertical; min-height: 100px; }
+button {
+    background: #1688d4;
+    color: white;
+    font-weight: bold;
+    border: 0;
+    cursor: pointer;
+}
+button:hover { background: #0875bc; }
+.muted { color: #a9bdd4; font-size: 14px; }
+.message {
+    padding: 12px;
+    margin-bottom: 12px;
+    background: #173653;
+    border-radius: 8px;
+}
+.post { white-space: pre-wrap; overflow-wrap: anywhere; }
+.file-row {
+    padding: 14px 0;
+    border-bottom: 1px solid #29425c;
+    overflow-wrap: anywhere;
+}
+.file-row:last-child { border-bottom: 0; }
+</style>
+</head>
+<body>
+<header>
+<nav>
+<div class="logo">❄ ChillyFile.io</div>
+<div>
+<a href="/">Home</a>
+{% if user %}
+<a href="/upload">Upload</a>
+<a href="/logout">Log out ({{ user }})</a>
+{% else %}
+<a href="/login">Log in</a>
+<a href="/register">Sign up</a>
+{% endif %}
+</div>
+</nav>
+</header>
+<main>
+{% with messages = get_flashed_messages() %}
+{% for message in messages %}
+<div class="message">{{ message }}</div>
+{% endfor %}
+{% endwith %}
+{{ content|safe }}
+</main>
+</body>
+</html>
+"""
 
-@app.get("/")
-def index():
-    return render_template_string(PAGE)
 
-@app.post("/upload")
-def upload():
-    file = request.files.get("file")
+def current_user():
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    with db() as connection:
+        user = connection.execute(
+            "SELECT username FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    return user["username"] if user else None
 
-    if not file or not file.filename:
-        return jsonify(error="No file selected"), 400
 
-    original = secure_filename(file.filename) or "file"
-    token = secrets.token_urlsafe(9)
-    stored_name = f"{token}__{original}"
-    destination = UPLOAD_DIR / stored_name
+def render_page(content):
+    return render_template_string(
+        PAGE, content=content, user=current_user()
+    )
 
-    try:
-        # Save the uploaded file in chunks to avoid loading
-        # the entire file into memory at once.
-        with open(destination, "wb") as output:
-            while True:
-                chunk = file.stream.read(1024 * 1024)  # 1 MB
-                if not chunk:
-                    break
-                output.write(chunk)
 
-    except Exception:
+@app.route("/")
+def home():
+    with db() as connection:
+        posts = connection.execute("""
+            SELECT posts.content, posts.created_at, users.username
+            FROM posts JOIN users ON users.id = posts.user_id
+            ORDER BY posts.id DESC LIMIT 100
+        """).fetchall()
+
+        files = connection.execute("""
+            SELECT files.token, files.filename, files.size,
+                   files.created_at, users.username
+            FROM files JOIN users ON users.id = files.uploader_id
+            ORDER BY files.id DESC LIMIT 100
+        """).fetchall()
+
+    post_html = "".join(
+        f'<div class="card"><strong>{escape_html(p["username"])}</strong>'
+        f'<p class="post">{escape_html(p["content"])}</p>'
+        f'<div class="muted">{escape_html(p["created_at"])}</div></div>'
+        for p in posts
+    ) or '<div class="card">No posts yet. Be the first to post!</div>'
+
+    file_html = "".join(
+        f'<div class="file-row"><a href="/f/{escape_html(f["token"])}">'
+        f'{escape_html(f["filename"])}</a>'
+        f'<div class="muted">{format_size(f["size"])} · '
+        f'Uploaded by {escape_html(f["username"])}</div></div>'
+        for f in files
+    ) or '<p class="muted">No files uploaded yet.</p>'
+
+    create_post = ""
+    if session.get("user_id"):
+        create_post = """
+        <div class="card">
+        <h2>Create a public post</h2>
+        <form method="post" action="/post">
+        <textarea name="content" maxlength="3000"
+        placeholder="What's on your mind?" required></textarea>
+        <button type="submit">Publish post</button>
+        </form></div>
+        """
+
+    content = f"""
+    <div class="card">
+    <h1>Welcome to ChillyFile.io ❄</h1>
+    <p>Share files and post updates with the community.</p>
+    {"<a href='/upload'>Upload a file</a>" if session.get("user_id") else "<a href='/register'>Create an account</a> to get started."}
+    </div>
+    {create_post}
+    <h2>Recent public posts</h2>
+    {post_html}
+    <div class="card"><h2>Public files</h2>{file_html}</div>
+    """
+    return render_page(content)
+
+
+def escape_html(value):
+    from html import escape
+    return escape(str(value), quote=True)
+
+
+def format_size(size):
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    if size < 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    return f"{size / (1024 * 1024 * 1024):.2f} GB"
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        if not re.fullmatch(r"[A-Za-z0-9_]{3,24}", username):
+            flash("Username must be 3–24 characters using letters, numbers, or underscores.")
+            return redirect(url_for("register"))
+
+        if len(password) < 10:
+            flash("Password must be at least 10 characters.")
+            return redirect(url_for("register"))
+
         try:
-            destination.unlink(missing_ok=True)
-        except OSError:
-            pass
+            with db() as connection:
+                cursor = connection.execute(
+                    "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                    (username, generate_password_hash(password))
+                )
+                session.clear()
+                session["user_id"] = cursor.lastrowid
+            flash("Your account has been created!")
+            return redirect(url_for("home"))
+        except sqlite3.IntegrityError:
+            flash("That username is already taken.")
+            return redirect(url_for("register"))
 
-        app.logger.exception("Upload failed")
-        return jsonify(error="Could not save this file"), 500
+    return render_page("""
+    <div class="card"><h1>Create account</h1>
+    <form method="post">
+    <label>Username</label>
+    <input name="username" minlength="3" maxlength="24"
+    pattern="[A-Za-z0-9_]+" autocomplete="username" required>
+    <label>Password (at least 10 characters)</label>
+    <input type="password" name="password" minlength="10"
+    autocomplete="new-password" required>
+    <button type="submit">Sign up</button>
+    </form></div>
+    """)
 
-    return jsonify(
-        url=request.host_url.rstrip("/") + "/f/" + token,
-        name=original
-             )
 
-@app.get("/f/<token>")
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        with db() as connection:
+            user = connection.execute(
+                "SELECT id, password_hash FROM users WHERE username = ?",
+                (username,)
+            ).fetchone()
+
+        if user and check_password_hash(user["password_hash"], password):
+            session.clear()
+            session["user_id"] = user["id"]
+            flash("Logged in successfully.")
+            return redirect(url_for("home"))
+
+        flash("Incorrect username or password.")
+        return redirect(url_for("login"))
+
+    return render_page("""
+    <div class="card"><h1>Log in</h1>
+    <form method="post">
+    <label>Username</label>
+    <input name="username" autocomplete="username" required>
+    <label>Password</label>
+    <input type="password" name="password"
+    autocomplete="current-password" required>
+    <button type="submit">Log in</button>
+    </form></div>
+    """)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("You have been logged out.")
+    return redirect(url_for("home"))
+
+
+@app.route("/post", methods=["POST"])
+@login_required
+def create_post():
+    content = request.form.get("content", "").strip()
+    if not content or len(content) > 3000:
+        flash("Posts must contain 1–3000 characters.")
+        return redirect(url_for("home"))
+
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO posts (user_id, content) VALUES (?, ?)",
+            (session["user_id"], content)
+        )
+    flash("Your post is now public.")
+    return redirect(url_for("home"))
+
+
+@app.route("/upload", methods=["GET", "POST"])
+@login_required
+def upload():
+    if request.method == "POST":
+        uploaded = request.files.get("file")
+        if not uploaded or not uploaded.filename:
+            flash("Choose a file first.")
+            return redirect(url_for("upload"))
+
+        filename = secure_filename(uploaded.filename)
+        if not filename:
+            flash("That filename is not allowed.")
+            return redirect(url_for("upload"))
+
+        token = secrets.token_urlsafe(18)
+        storage_key = f"{token}/{filename}"
+        size = 0
+
+        try:
+            if b2:
+                uploaded.stream.seek(0, os.SEEK_END)
+                size = uploaded.stream.tell()
+                uploaded.stream.seek(0)
+                b2.upload_fileobj(
+                    uploaded.stream,
+                    B2_BUCKET_NAME,
+                    storage_key,
+                    ExtraArgs={"ContentType": uploaded.mimetype or "application/octet-stream"}
+                )
+            else:
+                local_name = f"{token}__{filename}"
+                local_path = UPLOAD_DIR / local_name
+                uploaded.save(local_path)
+                size = local_path.stat().st_size
+                storage_key = local_name
+
+            with db() as connection:
+                connection.execute("""
+                    INSERT INTO files
+                    (token, filename, storage_key, size, uploader_id)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (token, filename, storage_key, size, session["user_id"]))
+
+        except Exception:
+            app.logger.exception("Upload failed")
+            flash("Upload failed. Check the server configuration and try again.")
+            return redirect(url_for("upload"))
+
+        flash("Upload complete!")
+        return redirect(url_for("f", token=token))
+
+    storage_message = (
+        "Backblaze B2 cloud storage is configured."
+        if b2 else
+        "Cloud storage is not configured yet. This upload will use temporary local storage."
+    )
+
+    return render_page(f"""
+    <div class="card"><h1>Upload a file</h1>
+    <p class="muted">Maximum file size: {MAX_FILE_MB} MB</p>
+    <p class="muted">{escape_html(storage_message)}</p>
+    <form method="post" enctype="multipart/form-data">
+    <input type="file" name="file" required>
+    <button type="submit">Upload file</button>
+    </form></div>
+    """)
+
+
+@app.route("/f/<token>")
+def f(token):
+    with db() as connection:
+        file_record = connection.execute(
+            "SELECT * FROM files WHERE token = ?", (token,)
+        ).fetchone()
+
+    if not file_record:
+        abort(404)
+
+    content = f"""
+    <div class="card"><h1>Your file is ready</h1>
+    <p>{escape_html(file_record["filename"])}</p>
+    <p class="muted">{format_size(file_record["size"])}</p>
+    <a href="/download/{escape_html(token)}"><button>Download file</button></a>
+    </div>
+    """
+    return render_page(content)
+
+
+@app.route("/download/<token>")
 def download(token):
-    matches = list(UPLOAD_DIR.glob(token + "__*"))
+    with db() as connection:
+        file_record = connection.execute(
+            "SELECT * FROM files WHERE token = ?", (token,)
+        ).fetchone()
 
-    if not matches:
+    if not file_record:
         abort(404)
 
-    path = matches[0]
-    filename = path.name.split("__", 1)[1]
-
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Download - ChillyFile</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {
-                background: #081426;
-                color: white;
-                font-family: Arial, sans-serif;
-                text-align: center;
-                padding: 100px 20px;
-            }
-            .box {
-                background: #0e2038;
-                padding: 40px;
-                border-radius: 16px;
-                max-width: 450px;
-                margin: auto;
-            }
-            h1 { color: #20a8ff; }
-            .button {
-                display: inline-block;
-                background: #168cff;
-                color: white;
-                padding: 15px 35px;
-                border-radius: 8px;
-                text-decoration: none;
-                font-weight: bold;
-                margin-top: 20px;
-            }
-            .filename {
-                overflow-wrap: anywhere;
-                color: #b8cbe5;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="box">
-            <h1>ChillyFile</h1>
-            <h2>Your file is ready!</h2>
-            <p class="filename">{{ filename }}</p>
-            <a class="button" href="{{ url_for('get_file', token=token) }}">
-                Download File
-            </a>
-        </div>
-    </body>
-    </html>
-    """, filename=filename, token=token)
-
-
-@app.get("/download/<token>")
-def get_file(token):
-    matches = list(UPLOAD_DIR.glob(token + "__*"))
-
-    if not matches:
-        abort(404)
-
-    path = matches[0]
+    if b2:
+        try:
+            response = b2.get_object(
+                Bucket=B2_BUCKET_NAME,
+                Key=file_record["storage_key"]
+            )
+            from flask import Response
+            return Response(
+                response["Body"].iter_chunks(chunk_size=1024 * 1024),
+                headers={
+                    "Content-Disposition": f'attachment; filename="{file_record["filename"]}"',
+                    "Content-Type": response.get("ContentType", "application/octet-stream")
+                }
+            )
+        except Exception:
+            app.logger.exception("Download from B2 failed")
+            abort(502)
 
     return send_from_directory(
         UPLOAD_DIR,
-        path.name,
+        file_record["storage_key"],
         as_attachment=True,
-        download_name=path.name.split("__", 1)[1]
+        download_name=file_record["filename"]
     )
- 
-    # Token is the random prefix; filenames are never accepted directly from the URL.
-    matches = list(UPLOAD_DIR.glob(token + "__*"))
-    if not matches:
-        abort(404)
-    path = matches[0]
-    return send_from_directory(UPLOAD_DIR, path.name, as_attachment=True, download_name=path.name.split("__",1)[1])
+
 
 @app.errorhandler(413)
-def too_large(_):
-    return jsonify(error=f"File is too large. Server limit is {MAX_FILE_MB} MB."), 413
+def too_large(error):
+    return render_page(
+        f"<div class='card'><h1>File too large</h1>"
+        f"<p>The maximum upload size is {MAX_FILE_MB} MB.</p></div>"
+    ), 413
+
 
 if __name__ == "__main__":
-    print("ChillyFile is starting at http://127.0.0.1:5000")
-    print("For local testing only. Read README before exposing it to the internet.")
-    app.run(host="127.0.0.1", port=int(os.environ.get("PORT","5000")), debug=False)
- 
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
