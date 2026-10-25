@@ -115,6 +115,26 @@ def initialize_database():
                 "ALTER TABLE users ADD COLUMN profile_picture TEXT"
             )
 
+        if "role" not in user_columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'"
+            )
+
+        # Safely bootstrap the existing chilly account only when no Owner exists.
+        owner_exists = connection.execute(
+            "SELECT id FROM users WHERE role = 'owner' LIMIT 1"
+        ).fetchone()
+        if not owner_exists:
+            chilly_user = connection.execute(
+                "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
+                ("chilly",)
+            ).fetchone()
+            if chilly_user:
+                connection.execute(
+                    "UPDATE users SET role = 'owner' WHERE id = ?",
+                    (chilly_user["id"],)
+                )
+
         file_columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(files)")
@@ -167,6 +187,44 @@ def login_required(function):
             return redirect(url_for("login"))
         return function(*args, **kwargs)
     return wrapper
+
+
+def owner_required(function):
+    @wraps(function)
+    @login_required
+    def wrapper(*args, **kwargs):
+        user = current_user()
+        if not user or user["role"] != "owner":
+            abort(403)
+        return function(*args, **kwargs)
+    return wrapper
+
+
+ROLE_INFO = {
+    "owner": ("❄️", "Owner"),
+    "admin": ("👁️", "Admin"),
+    "community_manager": ("😄", "Community Manager"),
+    "discord_member": ("🤩", "Discord Member"),
+    "chilly_friend": ("❤️", "Chilly’s Friend"),
+    "member": ("👤", "Member"),
+}
+
+ASSIGNABLE_ROLES = {
+    "admin": "Admin",
+    "community_manager": "Community Manager",
+    "discord_member": "Discord Member",
+    "chilly_friend": "Chilly’s Friend",
+    "member": "Member",
+}
+
+
+def role_badge(role):
+    emoji, label = ROLE_INFO.get(role or "member", ROLE_INFO["member"])
+    return f'<span class="role-badge" title="{escape_html(label)}" aria-label="{escape_html(label)}">{emoji}</span>'
+
+
+def user_label(username, role="member"):
+    return f'{escape_html(username)} {role_badge(role)}'
 
 
 def escape_html(value):
@@ -490,6 +548,32 @@ label {
     line-height: 1.5;
 }
 
+.role-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: 4px;
+    cursor: help;
+    font-size: 1em;
+    vertical-align: middle;
+}
+.admin-table { width: 100%; border-collapse: collapse; }
+.admin-table th, .admin-table td {
+    padding: 12px 8px;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+.admin-table select {
+    background: #070b12;
+    color: white;
+    border: 1px solid #263c5b;
+    border-radius: 8px;
+    padding: 9px;
+    max-width: 100%;
+}
+.admin-table button { margin-top: 0; }
+
 .inline-form { display: inline; }
 
 footer {
@@ -528,6 +612,10 @@ src="/avatar/{{ user['id'] }}" alt="">
 {% endif %}
 {{ user['username'] }}
 </a>
+<span class="role-badge" title="{{ user['role']|replace('_', ' ')|title }}">
+{% if user['role'] == 'owner' %}❄️{% elif user['role'] == 'admin' %}👁️{% elif user['role'] == 'community_manager' %}😄{% elif user['role'] == 'discord_member' %}🤩{% elif user['role'] == 'chilly_friend' %}❤️{% else %}👤{% endif %}
+</span>
+{% if user['role'] == 'owner' %}<a href="/admin">Admin Panel</a>{% endif %}
 <a href="/logout">Log out</a>
 {% else %}
 <a href="/login">Log in</a>
@@ -561,7 +649,7 @@ src="/avatar/{{ user['id'] }}" alt="">
 def home():
     with db() as connection:
         files = connection.execute("""
-            SELECT files.*, users.username
+            SELECT files.*, users.username, users.role
             FROM files
             JOIN users ON users.id = files.uploader_id
             ORDER BY files.id DESC
@@ -579,7 +667,7 @@ def home():
                 </a>
                 <div class="muted">
                     {format_size(file_record['size'])}
-                    · Uploaded by {escape_html(file_record['username'])}
+                    · Uploaded by <a href="/profile/{escape_html(file_record['username'])}">{user_label(file_record['username'], file_record['role'])}</a>
                 </div>
             </div>
             <a class="button"
@@ -640,9 +728,17 @@ def register():
 
         try:
             with db() as connection:
+                existing = connection.execute(
+                    "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
+                    (username,)
+                ).fetchone()
+                if existing:
+                    flash("That username is already taken.")
+                    return redirect(url_for("register"))
+
                 cursor = connection.execute("""
-                    INSERT INTO users (username, password_hash)
-                    VALUES (?, ?)
+                    INSERT INTO users (username, password_hash, role)
+                    VALUES (?, ?, 'member')
                 """, (
                     username,
                     generate_password_hash(password)
@@ -686,7 +782,7 @@ def login():
             user = connection.execute("""
                 SELECT id, password_hash
                 FROM users
-                WHERE username = ?
+                WHERE username = ? COLLATE NOCASE
             """, (username,)).fetchone()
 
         if user and check_password_hash(user["password_hash"], password):
@@ -799,7 +895,7 @@ def account():
         <div class="profile">
             {picture}
             <div>
-                <h1>{escape_html(user['username'])}</h1>
+                <h1>{user_label(user['username'], user['role'])}</h1>
                 <p class="muted">Your ChillyFile account</p>
                 <a class="button" href="/edit-profile">Edit Profile</a>
                 <a class="button" href="/upload">Upload Files</a>
@@ -842,7 +938,7 @@ def edit_profile():
         with db() as connection:
             existing = connection.execute("""
                 SELECT id FROM users
-                WHERE username = ? AND id != ?
+                WHERE username = ? COLLATE NOCASE AND id != ?
             """, (username, user["id"])).fetchone()
 
             if existing:
@@ -944,7 +1040,7 @@ def avatar(user_id):
 def public_profile(username):
     with db() as connection:
         user = connection.execute("""
-            SELECT * FROM users WHERE username = ?
+            SELECT * FROM users WHERE username = ? COLLATE NOCASE
         """, (username,)).fetchone()
 
         if not user:
@@ -963,21 +1059,23 @@ def public_profile(username):
         """, (user["id"],)).fetchall()
 
     post_rows = "".join(
-        f'<div class="card"><p class="post">{escape_html(p["content"])}</p>'
-        f'<div class="muted">{escape_html(p["created_at"])}</div></div>'
+        f'<div class="card"><div class="muted">{user_label(user["username"], user["role"])} · '
+        f'{escape_html(p["created_at"])}</div>'
+        f'<p class="post">{escape_html(p["content"])}</p></div>'
         for p in posts
     ) or '<p class="muted">No public posts yet.</p>'
 
     file_rows = "".join(
-        f'<div class="file-row"><a href="/f/{escape_html(f["token"])}">'
+        f'<div class="file-row"><div><a href="/f/{escape_html(f["token"])}">'
         f'📄 {escape_html(f["filename"])}</a>'
-        f'<span class="muted">{format_size(f["size"])}</span></div>'
+        f'<div class="muted">{format_size(f["size"])} · Uploaded by '
+        f'{user_label(user["username"], user["role"])}</div></div></div>'
         for f in files
     ) or '<p class="muted">No public files.</p>'
 
     content = f"""
     <div class="card">
-        <h1>{escape_html(user['username'])}</h1>
+        <h1>{user_label(user['username'], user['role'])}</h1>
         <p class="muted">Public profile</p>
     </div>
     <h2>Public Posts</h2>
@@ -999,7 +1097,7 @@ def public_profile(username):
 def discover():
     with db() as connection:
         posts = connection.execute("""
-            SELECT posts.*, users.username
+            SELECT posts.*, users.username, users.role
             FROM posts
             JOIN users ON users.id = posts.user_id
             ORDER BY posts.id DESC
@@ -1013,7 +1111,7 @@ def discover():
         <div class="card">
             <strong>
                 <a href="/profile/{escape_html(p['username'])}">
-                    @{escape_html(p['username'])}
+                    @{escape_html(p['username'])} {role_badge(p['role'])}
                 </a>
             </strong>
             <p class="post">{escape_html(p['content'])}</p>
@@ -1065,6 +1163,108 @@ def delete_post(post_id):
 
     flash("Post deleted.")
     return redirect(url_for("account"))
+
+
+# --------------------------------------------------
+# OWNER ADMIN PANEL / ROLE MANAGEMENT
+# --------------------------------------------------
+
+@app.route("/admin", methods=["GET", "POST"])
+@owner_required
+def admin_panel():
+    if request.method == "POST":
+        user_id_raw = request.form.get("user_id", "")
+        new_role = request.form.get("role", "")
+
+        if new_role not in ASSIGNABLE_ROLES:
+            flash("That role is not assignable.")
+            return redirect(url_for("admin_panel"))
+
+        try:
+            target_id = int(user_id_raw)
+        except (TypeError, ValueError):
+            flash("Invalid user.")
+            return redirect(url_for("admin_panel"))
+
+        with db() as connection:
+            target = connection.execute(
+                "SELECT id, username, role FROM users WHERE id = ?",
+                (target_id,)
+            ).fetchone()
+
+            if not target:
+                flash("User not found.")
+                return redirect(url_for("admin_panel"))
+
+            if target["role"] == "owner":
+                flash("The Owner role cannot be changed from the dashboard.")
+                return redirect(url_for("admin_panel"))
+
+            connection.execute(
+                "UPDATE users SET role = ? WHERE id = ?",
+                (new_role, target_id)
+            )
+
+        flash(f"Updated @{target['username']}'s role to {ROLE_INFO[new_role][1]}.")
+        return redirect(url_for("admin_panel"))
+
+    with db() as connection:
+        users = connection.execute("""
+            SELECT id, username, role, created_at
+            FROM users
+            ORDER BY username COLLATE NOCASE
+        """).fetchall()
+
+    rows = []
+    for account in users:
+        role = account["role"] or "member"
+        role_label = ROLE_INFO.get(role, ROLE_INFO["member"])[1]
+        options = []
+        for role_value, label in ASSIGNABLE_ROLES.items():
+            selected = " selected" if role == role_value else ""
+            options.append(
+                f'<option value="{escape_html(role_value)}"{selected}>{escape_html(label)}</option>'
+            )
+
+        if role == "owner":
+            action = '<strong>❄️ Owner — protected</strong>'
+        else:
+            action = f"""
+                <form method="post" action="/admin" class="inline-form">
+                    <input type="hidden" name="user_id" value="{account['id']}">
+                    <select name="role" aria-label="Role for {escape_html(account['username'])}">
+                        {''.join(options)}
+                    </select>
+                    <button type="submit">Save Role</button>
+                </form>
+            """
+
+        rows.append(f"""
+            <tr>
+                <td><a href="/profile/{escape_html(account['username'])}">@{escape_html(account['username'])}</a></td>
+                <td>{role_badge(role)} {escape_html(role_label)}</td>
+                <td>{escape_html(account['created_at'])}</td>
+                <td>{action}</td>
+            </tr>
+        """)
+
+    table_rows = "".join(rows) or '<tr><td colspan="4">No users yet.</td></tr>'
+    content = f"""
+        <div class="card">
+            <h1>❄️ Owner Control Panel</h1>
+            <p class="muted">Manage ChillyFile.io user roles. Only the Owner can access this page.</p>
+        </div>
+        <div class="card">
+            <h2>Users ({len(users)})</h2>
+            <div style="overflow-x:auto">
+                <table class="admin-table">
+                    <thead><tr><th>Username</th><th>Current Role</th><th>Joined</th><th>Change Role</th></tr></thead>
+                    <tbody>{table_rows}</tbody>
+                </table>
+            </div>
+        </div>
+    """
+    return render_page(content, "Owner Control Panel")
 
 
 # --------------------------------------------------
