@@ -145,6 +145,29 @@ def initialize_database():
                 (chilly_user["id"],)
             )
 
+        # Optional owner bootstrap/reset controlled only through Render environment
+        # variables. Never place the owner's password in source code or GitHub.
+        owner_username = os.environ.get("CHILLYFILE_OWNER_USERNAME", "Chilly").strip()
+        owner_password = os.environ.get("CHILLYFILE_OWNER_PASSWORD", "")
+        if owner_password:
+            if len(owner_password) < 12:
+                raise RuntimeError("CHILLYFILE_OWNER_PASSWORD must be at least 12 characters.")
+            owner_record = connection.execute(
+                "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
+                (owner_username,)
+            ).fetchone()
+            hashed_owner_password = generate_password_hash(owner_password)
+            if owner_record:
+                connection.execute(
+                    "UPDATE users SET password_hash = ?, role = 'owner' WHERE id = ?",
+                    (hashed_owner_password, owner_record["id"])
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'owner')",
+                    (owner_username, hashed_owner_password)
+                )
+
         file_columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(files)")
