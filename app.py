@@ -129,20 +129,21 @@ def initialize_database():
                 "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'"
             )
 
-        # Safely bootstrap the existing chilly account only when no Owner exists.
-        owner_exists = connection.execute(
-            "SELECT id FROM users WHERE role = 'owner' LIMIT 1"
+        # Ensure the existing @Chilly account is the site Owner.
+        # This only changes roles; it never deletes users, posts, files, or folders.
+        chilly_user = connection.execute(
+            "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
+            (os.environ.get("CHILLYFILE_OWNER_USERNAME", "Chilly"),)
         ).fetchone()
-        if not owner_exists:
-            chilly_user = connection.execute(
-                "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
-                ("chilly",)
-            ).fetchone()
-            if chilly_user:
-                connection.execute(
-                    "UPDATE users SET role = 'owner' WHERE id = ?",
-                    (chilly_user["id"],)
-                )
+        if chilly_user:
+            connection.execute(
+                "UPDATE users SET role = 'admin' WHERE role = 'owner' AND id != ?",
+                (chilly_user["id"],)
+            )
+            connection.execute(
+                "UPDATE users SET role = 'owner' WHERE id = ?",
+                (chilly_user["id"],)
+            )
 
         file_columns = {
             row["name"]
@@ -210,12 +211,12 @@ def owner_required(function):
 
 
 ROLE_INFO = {
-    "owner": ("❄️", "Owner"),
-    "admin": ("👁️", "Admin"),
-    "community_manager": ("😄", "Community Manager"),
-    "discord_member": ("🤩", "Discord Member"),
-    "chilly_friend": ("❤️", "Chilly’s Friend"),
-    "member": ("👤", "Member"),
+    "owner": ("Owner", "Owner"),
+    "admin": ("Admin", "Admin"),
+    "community_manager": ("Moderator", "Moderator"),
+    "discord_member": ("Discord Member", "Discord Member"),
+    "chilly_friend": ("Chilly’s Friend", "Chilly’s Friend"),
+    "member": ("Member", "Member"),
 }
 
 ASSIGNABLE_ROLES = {
@@ -228,8 +229,17 @@ ASSIGNABLE_ROLES = {
 
 
 def role_badge(role):
-    emoji, label = ROLE_INFO.get(role or "member", ROLE_INFO["member"])
-    return f'<span class="role-badge" title="{escape_html(label)}" aria-label="{escape_html(label)}">{emoji}</span>'
+    badge_text, label = ROLE_INFO.get(role or "member", ROLE_INFO["member"])
+    css_role = re.sub(r"[^a-z_]", "", role or "member")
+    return (f'<span class="role-badge role-{css_role}" '
+            f'title="{escape_html(label)}">{escape_html(badge_text)}</span>')
+
+
+def avatar_markup(user_id, picture, username, css_class="small-avatar"):
+    if picture:
+        return f'<img class="{css_class}" src="/avatar/{int(user_id)}" alt="{escape_html(username)} profile picture">'
+    initial = (str(username or "?").strip()[:1] or "?").upper()
+    return f'<span class="{css_class} avatar-fallback" aria-label="{escape_html(username)} avatar">{escape_html(initial)}</span>'
 
 
 def user_label(username, role="member"):
@@ -268,7 +278,8 @@ def render_page(content, title="ChillyFile.io"):
         PAGE,
         content=content,
         user=current_user(),
-        title=title
+        title=title,
+        role_badge=role_badge
     )
 
 
@@ -512,6 +523,8 @@ label {
 }
 
 .file-row:last-child { border-bottom: 0; }
+.folder-mark { display:inline-block; width:19px; height:13px; margin-right:9px; position:relative; border:1px solid #5aa9ff; border-radius:3px; background:#102b49; vertical-align:middle; }
+.folder-mark:before { content:""; position:absolute; top:-5px; left:1px; width:8px; height:4px; border:1px solid #5aa9ff; border-bottom:0; border-radius:3px 3px 0 0; background:#102b49; }
 
 .file-actions {
     display: flex;
@@ -558,14 +571,33 @@ label {
 }
 
 .role-badge {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    margin-left: 4px;
-    cursor: help;
-    font-size: 1em;
-    vertical-align: middle;
+    display: inline-flex; align-items: center; justify-content: center;
+    margin-left: 5px; padding: 3px 8px; border-radius: 999px;
+    border: 1px solid #275b8e; background: #102a45; color: #a9d7ff;
+    font-size: 11px; font-weight: 700; vertical-align: middle; white-space: nowrap;
 }
+.role-owner { background: #16365c; border-color: #4ba5ff; color: #d5ecff; }
+.role-admin { background: #202a3c; border-color: #6c85a9; color: #e1eaff; }
+.role-community_manager { background: #173d37; border-color: #2e9c82; color: #b7ffed; }
+.avatar-fallback { display: inline-flex; align-items: center; justify-content: center; font-weight: 800; color: #d8ecff; }
+.post-head { display:flex; align-items:center; gap:11px; margin-bottom:12px; }
+.post-head .small-avatar { flex: 0 0 auto; }
+.post-card { padding:18px; }
+
+.nav-shell { max-width:1100px; margin:auto; padding:12px 18px; display:flex; align-items:center; gap:14px; }
+.menu-button { margin:0; width:42px; height:42px; padding:8px; background:#101a2a; border:1px solid #29405e; display:grid; place-items:center; }
+.hamburger { width:20px; height:14px; display:flex; flex-direction:column; justify-content:space-between; }
+.hamburger span { height:2px; width:100%; background:#eaf4ff; border-radius:2px; }
+.logo { margin-right:auto; }
+.nav-user { display:flex; align-items:center; gap:8px; color:#eaf4ff; }
+.drawer-backdrop { position:fixed; inset:0; z-index:19; background:#0009; display:none; }
+.drawer { position:fixed; z-index:20; top:0; left:0; height:100vh; width:min(310px,86vw); padding:22px; background:#080d16; border-right:1px solid var(--border); transform:translateX(-105%); transition:transform .2s ease; box-shadow:12px 0 40px #0008; }
+.drawer.open { transform:translateX(0); }
+.drawer-backdrop.open { display:block; }
+.drawer-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:22px; }
+.drawer-links { display:flex; flex-direction:column; gap:5px; }
+.drawer-links a { display:block; margin:0; padding:13px 12px; border-radius:9px; color:#d9e9ff; background:#0d1522; }
+.drawer-links a:hover { background:#142640; }
 .admin-table { width: 100%; border-collapse: collapse; }
 .admin-table th, .admin-table td {
     padding: 12px 8px;
@@ -604,35 +636,46 @@ footer {
 
 <body>
 <header>
-<nav>
-<a class="logo" href="/">❄ Chilly<span>File</span></a>
-
-<div>
-<a href="/">Files</a>
-<a href="/discover">Discover</a>
-
-{% if user %}
-<a href="/account">
-{% if user['profile_picture'] %}
-<img class="small-avatar"
-src="/avatar/{{ user['id'] }}" alt="">
-{% else %}
-👤
-{% endif %}
-{{ user['username'] }}
-</a>
-<span class="role-badge" title="{{ user['role']|replace('_', ' ')|title }}">
-{% if user['role'] == 'owner' %}❄️{% elif user['role'] == 'admin' %}👁️{% elif user['role'] == 'community_manager' %}😄{% elif user['role'] == 'discord_member' %}🤩{% elif user['role'] == 'chilly_friend' %}❤️{% else %}👤{% endif %}
-</span>
-{% if user['role'] == 'owner' %}<a href="/admin">Admin Panel</a>{% endif %}
-<a href="/logout">Log out</a>
-{% else %}
-<a href="/login">Log in</a>
-<a href="/register">Sign up</a>
-{% endif %}
+<div class="nav-shell">
+    <button class="menu-button" type="button" id="menuToggle" aria-label="Open navigation menu" aria-expanded="false">
+        <span class="hamburger" aria-hidden="true"><span></span><span></span><span></span></span>
+    </button>
+    <a class="logo" href="/">Chilly<span>File</span></a>
+    {% if user %}
+      <a class="nav-user" href="/account">{% if user['profile_picture'] %}<img class="small-avatar" src="/avatar/{{ user['id'] }}" alt="">{% else %}<span class="small-avatar avatar-fallback">{{ user['username'][0]|upper }}</span>{% endif %}<span>{{ user['username'] }}</span>{{ role_badge(user['role'])|safe }}</a>
+    {% else %}<a class="button" href="/login">Log in</a>{% endif %}
 </div>
-</nav>
 </header>
+<div class="drawer-backdrop" id="drawerBackdrop"></div>
+<aside class="drawer" id="siteDrawer" aria-label="Main navigation">
+  <div class="drawer-head"><a class="logo" href="/">Chilly<span>File</span></a><button class="menu-button" type="button" id="menuClose" aria-label="Close navigation menu">✕</button></div>
+  <div class="drawer-links">
+    <a href="/">Files</a>
+    <a href="/discover">Discover</a>
+    {% if user %}
+      <a href="/account">My Profile &amp; Files</a>
+      <a href="/edit-profile">Edit Profile</a>
+      <a href="/upload">Upload Files</a>
+      {% if user['role'] == 'owner' %}<a href="/admin">Owner Console &amp; Badges</a>{% endif %}
+      <a href="/logout">Log out</a>
+    {% else %}
+      <a href="/login">Log in</a><a href="/register">Create account</a>
+    {% endif %}
+  </div>
+</aside>
+<script>
+(() => {
+ const drawer=document.getElementById('siteDrawer');
+ const backdrop=document.getElementById('drawerBackdrop');
+ const toggle=document.getElementById('menuToggle');
+ const close=document.getElementById('menuClose');
+ function setOpen(open){drawer.classList.toggle('open',open);backdrop.classList.toggle('open',open);toggle.setAttribute('aria-expanded',String(open));}
+ toggle.addEventListener('click',()=>setOpen(!drawer.classList.contains('open')));
+ close.addEventListener('click',()=>setOpen(false));
+ backdrop.addEventListener('click',()=>setOpen(false));
+ document.addEventListener('keydown',e=>{if(e.key==='Escape')setOpen(false)});
+})();
+</script>
 
 <main>
 {% with messages = get_flashed_messages() %}
@@ -644,7 +687,7 @@ src="/avatar/{{ user['id'] }}" alt="">
 {{ content|safe }}
 </main>
 
-<footer>ChillyFile.io · Simple file sharing</footer>
+<footer>ChillyFile.io · File sharing and community</footer>
 </body>
 </html>
 """
@@ -672,7 +715,7 @@ def home():
         <div class="file-row">
             <div>
                 <a href="/f/{escape_html(file_record['token'])}">
-                    📄 {escape_html(file_record['filename'])}
+                    {escape_html(file_record['filename'])}
                 </a>
                 <div class="muted">
                     {format_size(file_record['size'])}
@@ -868,7 +911,7 @@ def account():
     if user["profile_picture"]:
         picture = f'<img class="avatar" src="/avatar/{user["id"]}" alt="Profile picture">'
     else:
-        picture = '<div class="avatar" style="display:grid;place-items:center;font-size:30px">👤</div>'
+        picture = f'<span class="avatar avatar-fallback">{escape_html(user["username"][:1].upper())}</span>'
 
     file_rows = ""
 
@@ -877,7 +920,7 @@ def account():
         <div class="file-row">
             <div>
                 <a href="/f/{escape_html(f['token'])}">
-                    📄 {escape_html(f['filename'])}
+                    {escape_html(f['filename'])}
                 </a>
                 <div class="muted">{format_size(f['size'])}</div>
             </div>
@@ -897,10 +940,11 @@ def account():
     post_rows = ""
 
     for p in posts:
+        own_avatar = avatar_markup(user['id'], user['profile_picture'], user['username'])
         post_rows += f"""
-        <div class="card">
+        <div class="card post-card">
+            <div class="post-head">{own_avatar}<div><strong>@{escape_html(user['username'])}</strong> {role_badge(user['role'])}<div class="muted">{escape_html(p['created_at'])}</div></div></div>
             <p class="post">{escape_html(p['content'])}</p>
-            <div class="muted">{escape_html(p['created_at'])}</div>
             <form method="post" action="/delete-post/{p['id']}"
                   onsubmit="return confirm('Delete this post?')">
                 <button type="submit">Delete Post</button>
@@ -925,7 +969,7 @@ def account():
     </div>
 
     <div class="card">
-        <h2>My Uploaded Files</h2>
+        <h2>My Files</h2>
         {file_rows}
     </div>
 
@@ -1031,7 +1075,7 @@ def edit_profile():
             <input type="file" name="picture"
                    accept="image/png,image/jpeg,image/webp,image/gif">
 
-            <p class="muted">Maximum image size: 5 MB.</p>
+            <p class="muted">PNG, JPG, WEBP, or animated GIF · maximum 5 MB. GIF animations are supported.</p>
 
             <button type="submit">Save Changes</button>
         </form>
@@ -1088,17 +1132,18 @@ def public_profile(username):
 
     file_rows = "".join(
         f'<div class="file-row"><div><a href="/f/{escape_html(f["token"])}">'
-        f'📄 {escape_html(f["filename"])}</a>'
+        f'{escape_html(f["filename"])}</a>'
         f'<div class="muted">{format_size(f["size"])} · Uploaded by '
         f'{user_label(user["username"], user["role"])}</div></div></div>'
         for f in files
     ) or '<p class="muted">No public files.</p>'
 
     content = f"""
-    <div class="card">
-        <h1>{user_label(user['username'], user['role'])}</h1>
-        <p class="muted">Public profile</p>
-    </div>
+    <div class="card"><div class="profile">
+        {profile_avatar}
+        <div><h1>{user_label(user['username'], user['role'])}</h1>
+        <p class="muted">Public profile</p></div>
+    </div></div>
     <h2>Public Posts</h2>
     {post_rows}
     <div class="card">
@@ -1118,7 +1163,7 @@ def public_profile(username):
 def discover():
     with db() as connection:
         posts = connection.execute("""
-            SELECT posts.*, users.username, users.role
+            SELECT posts.*, users.username, users.role, users.profile_picture
             FROM posts
             JOIN users ON users.id = posts.user_id
             ORDER BY posts.id DESC
@@ -1128,15 +1173,15 @@ def discover():
     rows = ""
 
     for p in posts:
+        post_avatar = avatar_markup(p['user_id'], p['profile_picture'], p['username'])
         rows += f"""
-        <div class="card">
-            <strong>
-                <a href="/profile/{escape_html(p['username'])}">
-                    @{escape_html(p['username'])} {role_badge(p['role'])}
-                </a>
-            </strong>
+        <div class="card post-card">
+            <div class="post-head">
+                {post_avatar}
+                <div><a href="/profile/{escape_html(p['username'])}"><strong>@{escape_html(p['username'])}</strong></a>
+                {role_badge(p['role'])}<div class="muted">{escape_html(p['created_at'])}</div></div>
+            </div>
             <p class="post">{escape_html(p['content'])}</p>
-            <div class="muted">{escape_html(p['created_at'])}</div>
         </div>
         """
 
@@ -1248,7 +1293,7 @@ def admin_panel():
             )
 
         if role == "owner":
-            action = '<strong>❄️ Owner — protected</strong>'
+            action = '<strong>Owner — protected</strong>'
         else:
             action = f"""
                 <form method="post" action="/admin" class="inline-form">
@@ -1256,7 +1301,7 @@ def admin_panel():
                     <select name="role" aria-label="Role for {escape_html(account['username'])}">
                         {''.join(options)}
                     </select>
-                    <button type="submit">Save Role</button>
+                    <button type="submit">Save Badge</button>
                 </form>
             """
 
@@ -1272,14 +1317,14 @@ def admin_panel():
     table_rows = "".join(rows) or '<tr><td colspan="4">No users yet.</td></tr>'
     content = f"""
         <div class="card">
-            <h1>❄️ Owner Control Panel</h1>
-            <p class="muted">Manage ChillyFile.io user roles. Only the Owner can access this page.</p>
+            <h1>Owner Control Panel</h1>
+            <p class="muted">Manage member badges and roles here. Only @Chilly (Owner) can access this page.</p>
         </div>
         <div class="card">
             <h2>Users ({len(users)})</h2>
             <div style="overflow-x:auto">
                 <table class="admin-table">
-                    <thead><tr><th>Username</th><th>Current Role</th><th>Joined</th><th>Change Role</th></tr></thead>
+                    <thead><tr><th>Username</th><th>Current Role</th><th>Joined</th><th>Assign Badge</th></tr></thead>
                     <tbody>{table_rows}</tbody>
                 </table>
             </div>
@@ -1451,7 +1496,7 @@ def folder_page(token):
         <div class="file-row">
             <div>
                 <a href="/f/{escape_html(f['token'])}">
-                    📄 {escape_html(f['filename'])}
+                    {escape_html(f['filename'])}
                 </a>
                 <div class="muted">{format_size(f['size'])}</div>
             </div>
@@ -1480,7 +1525,7 @@ def folder_page(token):
 
     content = f"""
     <div class="card">
-        <h1>📁 {escape_html(folder['name'])}</h1>
+        <h1><span class="folder-mark" aria-hidden="true"></span>{escape_html(folder['name'])}</h1>
         <p class="muted">Shared folder</p>
         {owner_controls}
     </div>
@@ -1596,7 +1641,7 @@ def f(token):
     content = f"""
     <div class="card">
         <h1>File Ready</h1>
-        <p>📄 {escape_html(file_record['filename'])}</p>
+        <p>{escape_html(file_record['filename'])}</p>
         <p class="muted">{format_size(file_record['size'])}</p>
 
         <a class="button"
