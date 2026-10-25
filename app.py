@@ -4,6 +4,7 @@ import io
 import sqlite3
 import secrets
 from pathlib import Path
+from datetime import timedelta
 from functools import wraps
 from html import escape
 from urllib.parse import quote
@@ -20,6 +21,14 @@ from botocore.config import Config
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+
+# Optional "Keep me logged in" sessions last 30 days by default.
+# Set CHILLYFILE_REMEMBER_DAYS in your hosting environment to change this.
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(
+    days=max(1, int(os.environ.get("CHILLYFILE_REMEMBER_DAYS", "30")))
+)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 APP_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = APP_DIR / "uploads"
@@ -787,8 +796,14 @@ def login():
 
         if user and check_password_hash(user["password_hash"], password):
             session.clear()
+            # The checkbox makes the session cookie persistent for the configured period.
+            session.permanent = request.form.get("remember_me") == "yes"
             session["user_id"] = user["id"]
-            flash("Logged in successfully.")
+            flash(
+                "Logged in. You’ll stay signed in on this device."
+                if session.permanent
+                else "Logged in successfully."
+            )
             return redirect(url_for("account"))
 
         flash("Incorrect username or password.")
@@ -804,6 +819,12 @@ def login():
             <label>Password</label>
             <input type="password" name="password"
                    autocomplete="current-password" required>
+
+            <label style="display:flex;align-items:center;gap:9px;margin:8px 0 14px">
+                <input type="checkbox" name="remember_me" value="yes"
+                       style="width:auto;margin:0">
+                Keep me logged in on this device (up to 30 days)
+            </label>
 
             <button type="submit">Log in</button>
         </form>
