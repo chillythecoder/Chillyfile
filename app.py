@@ -1143,6 +1143,8 @@ def avatar(user_id):
 @app.route("/profile/<username>")
 def public_profile(username):
     viewer_id = session.get("user_id")
+    if viewer_id is not None:
+        viewer_id = int(viewer_id)
     with db() as connection:
         user = connection.execute("""
             SELECT * FROM users WHERE username = ? COLLATE NOCASE
@@ -1221,7 +1223,7 @@ def public_profile(username):
 @app.route("/follow/<int:target_id>", methods=["POST"])
 @login_required
 def toggle_follow(target_id):
-    viewer_id = session["user_id"]
+    viewer_id = int(session["user_id"])
     if viewer_id == target_id:
         flash("You cannot follow your own account.")
         return redirect(url_for("account"))
@@ -1260,20 +1262,22 @@ def search():
     if query:
         pattern = f"%{query}%"
         with db() as connection:
+            # Simple substring search avoids SQLite ESCAPE-string compatibility issues.
+            search_pattern = f"%{query}%"
             people = connection.execute("""
                 SELECT id, username, role, profile_picture
                 FROM users
-                WHERE username LIKE ? ESCAPE '\\'
+                WHERE username LIKE ? COLLATE NOCASE
                 ORDER BY username COLLATE NOCASE
                 LIMIT 50
-            """, (pattern.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_'),)).fetchall()
+            """, (search_pattern,)).fetchall()
             folders = connection.execute("""
                 SELECT folders.token, folders.name, folders.created_at, users.username
                 FROM folders JOIN users ON users.id = folders.owner_id
-                WHERE folders.name LIKE ? ESCAPE '\\'
+                WHERE folders.name LIKE ? COLLATE NOCASE
                 ORDER BY folders.id DESC
                 LIMIT 50
-            """, (pattern.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_'),)).fetchall()
+            """, (search_pattern,)).fetchall()
 
     people_rows = "".join(
         f'<div class="file-row"><div>{avatar_markup(person["id"], person["profile_picture"], person["username"])} '
