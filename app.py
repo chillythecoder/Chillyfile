@@ -113,6 +113,21 @@ def initialize_database():
             )
         """)
 
+        # Follow relationships are stored separately and safely added to existing databases.
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS followers (
+                follower_id INTEGER NOT NULL,
+                followed_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (follower_id, followed_id),
+                FOREIGN KEY (follower_id) REFERENCES users(id),
+                FOREIGN KEY (followed_id) REFERENCES users(id),
+                CHECK (follower_id != followed_id)
+            )
+        """)
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_followers_followed ON followers(followed_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_followers_follower ON followers(follower_id)")
+
         # Add new columns without deleting existing records.
         user_columns = {
             row["name"]
@@ -675,6 +690,7 @@ footer {
   <div class="drawer-links">
     <a href="/">Files</a>
     <a href="/discover">Discover</a>
+    <a href="/search">Search People &amp; Folders</a>
     {% if user %}
       <a href="/account">My Profile &amp; Files</a>
       <a href="/edit-profile">Edit Profile</a>
@@ -1126,6 +1142,7 @@ def avatar(user_id):
 
 @app.route("/profile/<username>")
 def public_profile(username):
+    viewer_id = session.get("user_id")
     with db() as connection:
         user = connection.execute("""
             SELECT * FROM users WHERE username = ? COLLATE NOCASE
@@ -1146,6 +1163,28 @@ def public_profile(username):
             ORDER BY id DESC
         """, (user["id"],)).fetchall()
 
+        follower_count = connection.execute(
+            "SELECT COUNT(*) FROM followers WHERE followed_id = ?", (user["id"],)
+        ).fetchone()[0]
+        following_count = connection.execute(
+            "SELECT COUNT(*) FROM followers WHERE follower_id = ?", (user["id"],)
+        ).fetchone()[0]
+        is_following = False
+        if viewer_id and viewer_id != user["id"]:
+            is_following = connection.execute(
+                "SELECT 1 FROM followers WHERE follower_id = ? AND followed_id = ?",
+                (viewer_id, user["id"])
+            ).fetchone() is not None
+
+    profile_avatar = avatar_markup(user['id'], user['profile_picture'], user['username'], 'avatar')
+    follow_button = ""
+    if viewer_id and viewer_id != user["id"]:
+        button_text = "Unfollow" if is_following else "Follow"
+        follow_button = (f'<form method="post" action="/follow/{user["id"]}" style="margin-top:10px">'
+                         f'<button type="submit">{button_text}</button></form>')
+    elif not viewer_id:
+        follow_button = '<p class="muted"><a href="/login">Log in</a> to follow this person.</p>'
+
     post_rows = "".join(
         f'<div class="card"><div class="muted">{user_label(user["username"], user["role"])} · '
         f'{escape_html(p["created_at"])}</div>'
@@ -1156,8 +1195,7 @@ def public_profile(username):
     file_rows = "".join(
         f'<div class="file-row"><div><a href="/f/{escape_html(f["token"])}">'
         f'{escape_html(f["filename"])}</a>'
-        f'<div class="muted">{format_size(f["size"])} · Uploaded by '
-        f'{user_label(user["username"], user["role"])}</div></div></div>'
+        f'<div class="muted">{format_size(f["size"])}</div></div></div>'
         for f in files
     ) or '<p class="muted">No public files.</p>'
 
@@ -1165,7 +1203,9 @@ def public_profile(username):
     <div class="card"><div class="profile">
         {profile_avatar}
         <div><h1>{user_label(user['username'], user['role'])}</h1>
-        <p class="muted">Public profile</p></div>
+        <p class="muted">Public profile</p>
+        <p><strong>{follower_count}</strong> followers · <strong>{following_count}</strong> following</p>
+        {follow_button}</div>
     </div></div>
     <h2>Public Posts</h2>
     {post_rows}
@@ -1176,6 +1216,94 @@ def public_profile(username):
     """
 
     return render_page(content, f"{user['username']} - ChillyFile")
+
+
+@app.route("/follow/<int:target_id>", methods=["POST"])
+@login_required
+def toggle_follow(target_id):
+    viewer_id = session["user_id"]
+    if viewer_id == target_id:
+        flash("You cannot follow your own account.")
+        return redirect(url_for("account"))
+
+    with db() as connection:
+        target = connection.execute(
+            "SELECT username FROM users WHERE id = ?", (target_id,)
+        ).fetchone()
+        if not target:
+            abort(404)
+        existing = connection.execute(
+            "SELECT 1 FROM followers WHERE follower_id = ? AND followed_id = ?",
+            (viewer_id, target_id)
+        ).fetchone()
+        if existing:
+            connection.execute(
+                "DELETE FROM followers WHERE follower_id = ? AND followed_id = ?",
+                (viewer_id, target_id)
+            )
+            flash(f"You unfollowed @{target['username']}.")
+        else:
+            connection.execute(
+                "INSERT OR IGNORE INTO followers (follower_id, followed_id) VALUES (?, ?)",
+                (viewer_id, target_id)
+            )
+            flash(f"You are now following @{target['username']}!")
+
+    return redirect(url_for("public_profile", username=target["username"]))
+
+
+@app.route("/search")
+def search():
+    query = request.args.get("q", "").strip()[:100]
+    people = []
+    folders = []
+    if query:
+        pattern = f"%{query}%"
+        with db() as connection:
+            people = connection.execute("""
+                SELECT id, username, role, profile_picture
+                FROM users
+                WHERE username LIKE ? ESCAPE '\\'
+                ORDER BY username COLLATE NOCASE
+                LIMIT 50
+            """, (pattern.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_'),)).fetchall()
+            folders = connection.execute("""
+                SELECT folders.token, folders.name, folders.created_at, users.username
+                FROM folders JOIN users ON users.id = folders.owner_id
+                WHERE folders.name LIKE ? ESCAPE '\\'
+                ORDER BY folders.id DESC
+                LIMIT 50
+            """, (pattern.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_'),)).fetchall()
+
+    people_rows = "".join(
+        f'<div class="file-row"><div>{avatar_markup(person["id"], person["profile_picture"], person["username"])} '
+        f'<a href="/profile/{escape_html(person["username"])}"><strong>@{escape_html(person["username"])}</strong></a>'
+        f' {role_badge(person["role"])}<div class="muted">Open profile to follow</div></div></div>'
+        for person in people
+    ) or ('<p class="muted">No people found.</p>' if query else '<p class="muted">Enter a username to search.</p>')
+
+    folder_rows = "".join(
+        f'<div class="file-row"><div><span class="folder-mark" aria-hidden="true"></span>'
+        f'<a href="/folder/{escape_html(folder["token"])}"><strong>{escape_html(folder["name"])}</strong></a>'
+        f'<div class="muted">Shared by <a href="/profile/{escape_html(folder["username"])}">@{escape_html(folder["username"])}</a>'
+        f' · {escape_html(folder["created_at"])}</div></div></div>'
+        for folder in folders
+    ) or ('<p class="muted">No folders found.</p>' if query else '<p class="muted">Enter a folder name to search.</p>')
+
+    content = f"""
+    <div class="card">
+      <h1>Search ChillyFile</h1>
+      <p class="muted">Find people and shared folders.</p>
+      <form method="get" action="/search">
+        <label for="q">Search</label>
+        <input id="q" name="q" maxlength="100" value="{escape_html(query)}" placeholder="Username or folder name..." required>
+        <button type="submit">Search</button>
+      </form>
+    </div>
+    <div class="card"><h2>People</h2>{people_rows}</div>
+    <div class="card"><h2>Folders</h2>{folder_rows}</div>
+    """
+    return render_page(content, "Search - ChillyFile")
 
 
 # --------------------------------------------------
