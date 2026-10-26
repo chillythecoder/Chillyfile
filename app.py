@@ -144,6 +144,9 @@ def initialize_database():
                 "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'"
             )
 
+        if "player_id" not in user_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN player_id TEXT")
+
         # Ensure the existing @Chilly account is the site Owner.
         # This only changes roles; it never deletes users, posts, files, or folders.
         chilly_user = connection.execute(
@@ -182,6 +185,20 @@ def initialize_database():
                     "INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'owner')",
                     (owner_username, hashed_owner_password)
                 )
+
+        # Assign stable public Player IDs to every existing account that lacks one.
+        # The numeric database ID is already unique, so these IDs remain unique too.
+        account_rows = connection.execute(
+            "SELECT id FROM users WHERE player_id IS NULL OR player_id = ''"
+        ).fetchall()
+        for account_row in account_rows:
+            connection.execute(
+                "UPDATE users SET player_id = ? WHERE id = ?",
+                (f"CF-{int(account_row['id']):06d}", account_row["id"])
+            )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_player_id ON users(player_id)"
+        )
 
         file_columns = {
             row["name"]
@@ -910,6 +927,10 @@ def login():
 
             <button type="submit">Log in</button>
         </form>
+        <div style="border-top:1px solid var(--border, #ddd);margin-top:20px;padding-top:16px;text-align:center">
+            <a class="button" href="/register" style="display:inline-block;text-decoration:none">👤 Create an Account</a>
+            <p class="muted" style="margin:10px 0 0">New to ChillyFile? Create your free account.</p>
+        </div>
     </div>
     """)
 
@@ -1001,6 +1022,7 @@ def account():
             <div>
                 <h1>{user_label(user['username'], user['role'])}</h1>
                 <p class="muted">Your ChillyFile account</p>
+                <p><strong>Player ID:</strong> {escape_html(user['player_id'] or f"CF-{int(user['id']):06d}")}</p>
                 <a class="button" href="/edit-profile">Edit Profile</a>
                 <a class="button" href="/upload">Upload Files</a>
             </div>
@@ -1142,6 +1164,11 @@ def avatar(user_id):
 
 @app.route("/profile/<username>")
 def public_profile(username):
+    # Profiles are only visible to visitors who have created an account and are signed in.
+    if not session.get("user_id"):
+        flash("Create a ChillyFile account to view profiles.")
+        return redirect(url_for("register"))
+
     viewer_id = session.get("user_id")
     if viewer_id is not None:
         viewer_id = int(viewer_id)
